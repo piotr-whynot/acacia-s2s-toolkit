@@ -5,11 +5,11 @@
 import xarray as xr
 import numpy as np
 import pandas as pd
-import glob as glob
+from glob import glob
 from pathlib import Path
 
 def cleanup_idx_files(filename_prefix):
-    for path_str in glob.glob(f"{filename_prefix}*.idx"):
+    for path_str in glob(f"{filename_prefix}*.idx"):
         path = Path(path_str)
         if path.is_file():
             path.unlink()
@@ -21,11 +21,11 @@ def refine_combined_array(combined,leveltype,rf=False):
                 combined = combined.rename({'isobaricInhPa':'level'})
             # Only transpose dims that actually exist
             combined = combined.transpose(
-                *[d for d in ['hc_init_date','step','member','level','latitude','longitude'] if d in combined.dims]
+                *[d for d in ['hc_init_date','lead_time','member','level','latitude','longitude'] if d in combined.dims]
             )
         else:
             combined = combined.transpose(
-                *[d for d in ['hc_init_date','step','member','latitude','longitude'] if d in combined.dims]
+                *[d for d in ['hc_init_date','lead_time','member','latitude','longitude'] if d in combined.dims]
             )
     else:
         if leveltype == 'pressure':
@@ -33,61 +33,94 @@ def refine_combined_array(combined,leveltype,rf=False):
                 combined = combined.rename({'isobaricInhPa':'level'})
             # Only transpose dims that actually exist
             combined = combined.transpose(
-                *[d for d in ['time','member','level','latitude','longitude'] if d in combined.dims]
+                *[d for d in ['valid_time','member','level','latitude','longitude'] if d in combined.dims]
             )
         else:
             combined = combined.transpose(
-                *[d for d in ['time','member','latitude','longitude'] if d in combined.dims]
+                *[d for d in ['valid_time','member','latitude','longitude'] if d in combined.dims]
             )
     return combined
 
 def merge_all_ens_members(filename,leveltype):
-    # open all ensemble members. drop step and time variables. Just use valid time.
-    all_fcs = xr.open_mfdataset(f'{filename}_allens_*',engine='cfgrib',combine='nested',concat_dim='fc_init_member') # open mfdataset but have fc_init_member as a dimension
+    filenames = sorted(glob(f"{filename}_allens_*.nc"),key=lambda x: int(x.split("_allens_")[-1].replace(".nc", ""))) # sort filenames so largest lag goes first
+    prepared = []
+    member_offset = 0
         
-    if "fc_init_member" not in all_fcs.dims: # in case only one member is downloaded
-        all_fcs = all_fcs.expand_dims("fc_init_member")
+    for filename in filenames:
+        ds = xr.open_dataset(filename)
+        n_members = ds.sizes["number"]
+        
+        # Preserve the original step as lead_time before replacing the dimension
+        ds = ds.assign_coords(lead_time=("step", ds["step"].values))
+        
+        # Use the existing valid_time as the dimension
+        ds = (ds.swap_dims({"step": "valid_time"}).drop_vars("step").rename({"number": "member"}))
+        
+        # Give every member a unique index across all lagged forecasts
+        ds = ds.assign_coords(member=np.arange(member_offset,member_offset + n_members,dtype=np.int32,))
+        
+        # Each lag has a different initialisation time.
+        # Expand it so it becomes time(member).
+        init_time = ds["time"].values
+        # use name fc_init_date
+        ds = ds.drop_vars("time").assign_coords(fc_init_date=("member", np.full(n_members, init_time)))
+        
+        # Expand lead_time(valid_time) to lead_time(valid_time, member)
+        lead_time, _ = xr.broadcast(ds["lead_time"],ds["member"],)
+        
+        ds = ds.assign_coords(lead_time=lead_time)
+     
+        prepared.append(ds)
+        member_offset += n_members
 
-    if np.size(all_fcs.fc_init_member) == 1: # if only one forecast member is present
-        if "valid_time" not in all_fcs.dims:
-            if "valid_time" not in all_fcs.coords:
-                all_fcs = all_fcs.expand_dims("valid_time")
-            else:
-                all_fcs = all_fcs.swap_dims({"step":"valid_time"})
-        all_fcs = all_fcs.drop_vars(['step','time'])
-    else: # concatenating forecasts from lagged ensemble. 
-        cleanup_idx_files(filename) # annoying index files. these appear when reading the file in 'cfgrib'
-        all_data = []
-        # reopen files individually
-        files = glob.glob(f'{filename}_allens_*')
-        for file in files:
-            single_fc = xr.load_dataset(file,engine='cfgrib')
-            single_fc = single_fc.swap_dims({"step":"valid_time"})
-            single_fc = single_fc.drop_vars(['step','time'])
-
-            all_data.append(single_fc)
-        all_fcs = xr.concat(all_data,dim='fc_init_member')
-
-    # stack, forecast init member and nunber
-    combined = all_fcs.stack(member=("fc_init_member", "number")).reset_index("member", drop=True)
-    combined = combined.rename({'valid_time':'time'})
-
-    # put forecast initialisation time as an attribute
-    try: # try adding forecast initialisation time (slightly off if lagged ensemble) - something to fix. 
-        if np.size(all_fcs['time']) == 1:
-            combined.attrs['Forecast_initialisation_time'] = str(all_fcs['time'].values)
-    except:
-        pass
-
-    refine_combined_array(combined,leveltype)
-
+    if np.size(filenames) == 1:
+        combined = prepared[0]
+    else:
+        combined = xr.concat(prepared,dim="member",
+                join="exact",          # Require identical valid_time values
+                data_vars="minimal",coords="minimal",compat="override",)
+        
     return combined
 
 def merge_all_ens_hindcasts(filename,leveltype):
-    all_fcs = xr.open_mfdataset(f'{filename}_allens_*',combine='nested') # open mfdataset but have fc_init_member as a dimension, i.e. number of forecast initialisations used.
-    all_fcs = all_fcs.rename({'number': 'member'})
+    filenames = sorted(glob(f"{filename}_allens_*.nc"),key=lambda x: int(x.split("_allens_")[-1].replace(".nc", ""))) # sort filenames so largest lag goes first
+    prepared = []
+    member_offset = 0
 
-    combined = refine_combined_array(all_fcs,leveltype,rf=True)
+    for filename in filenames:
+        ds = xr.open_dataset(filename)
+        n_members = ds.sizes["number"]
+
+        # Preserve the original step as lead_time before replacing the dimension
+        ds = ds.assign_coords(lead_time=("step", ds["step"].values))
+
+        # Use the existing lead_time as the dimension
+        ds = (ds.swap_dims({"step": "lead_time"}).drop_vars("step").rename({"number": "member"}))
+
+        # Give every member a unique index across all lagged forecasts
+        ds = ds.assign_coords(member=np.arange(ds.sizes["member"],dtype=np.int32,))
+
+        # Each lag has a different initialisation time.
+        # Expand it so it becomes time(member).
+        ds = ds.assign_coords(hc_init_date=("time", ds["time"].values))
+        # use hc_init_time as dimension 
+        ds = ds.swap_dims({"time": "hc_init_date"}).drop_vars("time")
+
+        # Expand lag(member) to lag(hc_init_date, member)
+        lag_2d = np.broadcast_to(ds["lag"].values,(
+            ds.sizes["hc_init_date"],
+            ds.sizes["member"],))
+
+        ds = ds.drop_vars("lag").assign_coords(lag=(("hc_init_date", "member"),lag_2d,))
+        prepared.append(ds)
+        member_offset += n_members
+
+    if np.size(filenames) == 1:
+        combined = prepared[0]
+    else:
+        combined = xr.concat(prepared,dim="hc_init_date",
+                join="exact",          # Require identical lead_time values
+                coords="minimal",compat='override')
 
     return combined
 

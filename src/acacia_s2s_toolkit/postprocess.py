@@ -111,7 +111,6 @@ def _check_grid_overlap(obs, hindcast, raise_if_missing=True, threshold=0.9):
         return True
 
 
-
 def _harmonize_coords(ds):
     """
     Harmonize coordinate names to standard names: lat, lon, time.

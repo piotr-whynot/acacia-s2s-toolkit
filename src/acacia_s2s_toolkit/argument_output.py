@@ -463,9 +463,6 @@ def output_formatted_leadtimes(leadtime_hour, fcdate, variable, origin_id,period
     else:
         step_hours = 24
 
-    start_lt = leadtime_hour[0]+(24*lag)
-    end_lt = leadtime_hour[-1]
-
     # ---------- ALL POSSIBLE LEADTIMES ----------
     # full model grid for checking lagged lead times
     fclength = int(get_single_parameter(origin_id, fcdate, 'fcLength'))
@@ -500,32 +497,19 @@ def output_formatted_leadtimes(leadtime_hour, fcdate, variable, origin_id,period
     max_lag_days = np.max(np.abs(fc_enslags_arr.astype(int)))
     
     fclength_days = fclength // 24
-    period_days = int(period[:-1])
-    
-    # Length of overlap in valid time across all lag members
     overlap_days = fclength_days - max_lag_days
+    # Final valid-time endpoint available to every lag member
+    overlap_end_hour = (fclength_days - max_lag_days) * 24
     
-    # Number of COMPLETE aggregation periods available
-    n_complete_periods = overlap_days // period_days
-    
-    # End of final complete period in valid time
-    common_period_end = min(
-        VT_end_req,
-        n_complete_periods * period_days * 24
-    )
-    
-    # For daily means, each requested lead time is the start of a
-    # 24-hour interval, so exclude the common endpoint itself.
     if time_resolution.startswith("aver"):
+        # Each lead time h represents the interval h to h + step_hours
         VT_filtered = leadtime_hour_arr[
             (leadtime_hour_arr >= VT_start)
-            & (leadtime_hour_arr < common_period_end)
-        ]
+            & ((leadtime_hour_arr + step_hours) <= overlap_end_hour)]
     else:
         VT_filtered = leadtime_hour_arr[
             (leadtime_hour_arr >= VT_start)
-            & (leadtime_hour_arr <= common_period_end)
-        ]
+            & (leadtime_hour_arr <= overlap_end_hour)]
     
     if VT_filtered.size == 0:
         raise ValueError(
@@ -564,13 +548,12 @@ def output_formatted_leadtimes(leadtime_hour, fcdate, variable, origin_id,period
         leadtimes = "/".join(str(int(h)) for h in leadtime_hour_copy)
 
     print(
-    f"fcLength={fclength_days}d, "
-    f"max_lag={max_lag_days}d, "
-    f"overlap={overlap_days}d, "
-    f"complete_periods={n_complete_periods}, "
-    f"common_period_end={common_period_end/24}d"
+        f"fcLength={fclength_days}d, "
+        f"max_lag={max_lag_days}d, "
+        f"overlap={overlap_days}d, "
+        f"overlap_end={overlap_end_hour / 24}d"
     )
-
+    
     return leadtimes, convert_fcdate
 
 def create_reforecast_dates(rfyears,rfdate):

@@ -7,6 +7,7 @@ import os
 import sys
 import datetime
 import numpy as np
+import xarray as xr
 
 # this is for sphinx - only functions listed here will have entries in readthedocs API
 __all__ = ["download_hindcast"]
@@ -45,7 +46,6 @@ def download_hindcast(variable,
                       grid="1.5x1.5",
                       rf_enslags=None,
                       rf_years=None,
-                      fc_time=False,
                       overwrite=False,
                       verbose=True,
                       cleanup=True):
@@ -87,8 +87,6 @@ def download_hindcast(variable,
         Hindcast years passed to downstream request logic.
     rf_enslags : optional
         Hindcast ensemble lag selection passed to downstream request logic.
-    fc_time : bool
-        Passed to hindcast request logic.
     overwrite : bool
         If False and file exists already, skip the download.
     verbose : bool
@@ -252,12 +250,12 @@ def download_hindcast(variable,
             if verbose:
                 ecdsAPI_requests.request_hindcast(fcdate,origin_id,grid_for_request,variable,bbox_bounds,data_format,
                                                       webapi_param,leadtime_hour,period,leveltype,filename_save,plevs,
-                                                      rf_enslags,rf_years,start_lt,aggregation_switch,fc_time=fc_time,cleanup=cleanup)
+                                                      rf_enslags,rf_years,start_lt,aggregation_switch,cleanup=cleanup)
             else:
                 with SuppressOutput():
                     ecdsAPI_requests.request_hindcast(fcdate,origin_id,grid_for_request,variable,bbox_bounds,data_format,
                                                       webapi_param,leadtime_hour,period,leveltype,filename_save,plevs,
-                                                      rf_enslags,rf_years,start_lt,aggregation_switch,fc_time=fc_time,cleanup=cleanup)
+                                                      rf_enslags,rf_years,start_lt,aggregation_switch,cleanup=cleanup)
         elif variable == 'TC_TRACKS':
             if verbose:
                 download_S2Stc_tracks.download_reforecast_TCtracks(
@@ -268,7 +266,6 @@ def download_hindcast(variable,
                     filename_save,
                     rf_enslags,
                     rf_years,
-                    fc_time
                 )
             else:
                 with SuppressOutput():
@@ -280,10 +277,68 @@ def download_hindcast(variable,
                         filename_save,
                         rf_enslags,
                         rf_years,
-                        fc_time
                     )
     except Exception as e:
         print(f"[ERROR] Download failed for {filename_save}")
         raise
 
     return filename__save
+
+def align_to_nominal_forecast_time(rf_set):
+    '''
+    A function that aligns downloaded reforecast to nominal forecast date.
+    '''
+    lag_days = rf_set['lag'] * np.timedelta64(1,'D')
+    valid_time_lagged = (rf_set.valid_time - lag_days)
+    hc_nominal_init_date = (rf_set.hc_init_date - lag_days)
+
+    rf_set = rf_set.assign_coords(hc_nominal_init_date=hc_nominal_init_date,
+                                  valid_time=valid_time_lagged,)
+
+    nominal_dates = np.unique(hc_nominal_init_date.values)
+
+    nominal_sets = []
+
+    for nominal_date in nominal_dates:
+        # Stack each native initialisation/member combination
+        subset = rf_set.stack(source_member=("hc_init_date", "member"))
+
+        # Select the members belonging to this nominal initialisation
+        mask = (subset["hc_nominal_init_date"] == nominal_date).compute()
+
+        subset = subset.isel(source_member=np.flatnonzero(mask.values))
+
+        # Retrieve the aligned valid-time axis.
+        # It should be the same across all selected members.
+        valid_time = subset["valid_time"].isel(source_member=0)
+
+        # Sanity check: all members should have identical aligned valid times
+        expected_valid_time = valid_time.broadcast_like(subset["valid_time"])
+
+        if not np.array_equal(subset["valid_time"].values,expected_valid_time.values,):
+            raise ValueError(
+                f"Aligned valid times differ between members for "
+                f"{nominal_date!s}"
+            )
+
+        # Preserve the original lag before resetting the stacked index
+        lag = subset["lag"].reset_index("source_member", drop=True)
+
+        # Remove coordinates inherited from the stacked dimensions
+        subset = subset.reset_index("source_member", drop=True)
+
+        subset = subset.rename(source_member="member")
+        subset = subset.assign_coords(member=np.arange(subset.sizes["member"]),lag=("member", lag.values),valid_time=("lead_time", valid_time.values),)
+
+        # Add the new nominal initialisation dimension as a single value
+        subset = subset.drop_vars("hc_nominal_init_date",errors="ignore",)
+        subset = subset.assign_coords(hc_nominal_init_date=np.datetime64(nominal_date))
+
+        nominal_sets.append(subset)
+
+    result = xr.concat(nominal_sets,dim="hc_nominal_init_date",join="exact",)
+
+    output_rf_set = result.transpose("hc_nominal_init_date","member","lead_time","latitude","longitude",)
+
+    return output_rf_set
+
