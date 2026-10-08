@@ -1,1 +1,4 @@
 check if all processing functions work in all situations considering name of the time variable
+
+
+obs without member dimensino should not have enslag coordinate
